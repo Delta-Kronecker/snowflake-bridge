@@ -1,0 +1,19 @@
+# Generated bridge lines and probe reports
+bridges_*.txt
+front_report.json
+bridge_probe_report.json
+
+# Local Tor state, logs and the scratch diagnostics used while building the
+# tunnel stage. That stage now lives in SnowflakeBridgeBuilder.py, so these
+# are kept only as a local record.
+torcheck/
+
+# Keys and credentials must never be committed
+*.key
+keys/
+
+# Go probe: the tunnel stage in SnowflakeBridgeBuilder.py supersedes it
+sfprobe/
+
+__pycache__/
+*.pyc

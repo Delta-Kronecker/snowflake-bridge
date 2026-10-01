@@ -12,9 +12,13 @@ import os
 import socket
 import ssl
 import json
+import re
 import sys
 import time
 import concurrent.futures
+import shutil
+import subprocess
+import tempfile
 from collections import defaultdict
 
 # aiortc is only needed for the deep relay-liveness stage. The bridge generator
@@ -78,7 +82,6 @@ DOMAINS = [
     "fastly.jsdelivr.net",
     "cdn.jsdelivr.net",        # Cloudflare, kept for CDN diversity
     "www.reddit.com",          # scored 0 but is on 151.101.* (Fastly)
-    "www.bbc.com",
     "www.theguardian.com",
     "www.bloomberg.com",
     "www.forbes.com",
@@ -452,7 +455,13 @@ IP_FP_PAIRS = [
     ("10.0.3.2:8080", FP_TB2),
 ]
 
-STUN = "ice=stun:stun.l.google.com:19302,stun:stun.antisip.com:3478"
+# The STUN list from a bridge line that is confirmed to work end to end. A
+# two server list leaves NAT traversal failing often enough that the DataChannel
+# opens but never carries the relay handshake, which looks like a dead bridge.
+STUN = ("ice=stun:stun.nextcloud.com:443,stun:stun.sipgate.net:10000,"
+        "stun:stun.epygi.com:3478,stun:stun.uls.co.za:3478,"
+        "stun:stun.voipgate.com:3478,stun:stun.bethesda.net:3478,"
+        "stun:stun.mixvoip.com:3478")
 UTLS = "utls-imitate=hellorandomizedalpn"
 
 # ---------------------------------------------------------------------------
@@ -480,8 +489,15 @@ COVERTDLS_DISABLE = "covertdtls-config=disable"
 COVERTDTLS_FP = "covertdtls-fingerprint=chrome"
 UTLS_NOSNI = "utls-nosni=true"
 MAX_CONNS = "max=10"
-AMPCACHE = ("ampcache=https://cdn.ampproject.org/c/s/www/"
-            "snowflake-broker.torproject.net")
+# Plain AMP cache domain. The longer /c/s/www/<broker> form was never usable:
+# the cache has to be a bare host, and a working line uses exactly this value.
+AMPCACHE = "ampcache=https://cdn.ampproject.org/"
+
+# Hosts that can fetch the relay through the AMP cache. When ampcache is in use
+# the front list must contain at least one of these, otherwise the broker
+# rejects every offer with "Unexpected error, no answer" and the bridge never
+# connects at all.
+AMPCACHE_FRONTS = ("cdn.ampproject.org", "www.ampproject.org")
 SQSQUEUE = "sqsqueue=https://sqs.us-east-1.amazonaws.com/xxxxxxxxxxxx/queue2"
 SQSCREDS = ("sqscreds=AKIAIOSFODNN7EXAMPLE/wJalrXUtnFEMI/"
             "K7MDENG/bPxRfiCYEXAMPLEKEY")
@@ -520,9 +536,12 @@ def build_level(level, fronts, pairs=None, profile="safe"):
       "stealth"- the obfuscation-hardened set (no SNI, mimicking DTLS)
     """
     tiers = {
-        1: {"url": BROKER_URL, "front": "__FRONT__"},
+        # ice is in every tier. Without a STUN server list the DataChannel opens
+        # but the relay handshake stalls, and such a line looks broken while the
+        # bridge itself is fine.
+        1: {"url": BROKER_URL, "front": "__FRONT__", "ice": _ICE_VALUES},
         2: {"url": BROKER_URL, "front": "__FRONT__", "ice": _ICE_VALUES},
-        3: {"url": BROKER_URL, "front": "__FRONT__",
+        3: {"url": BROKER_URL, "front": "__FRONT__", "ice": _ICE_VALUES,
             "utls-imitate": "hellorandomizedalpn"},
         4: {"url": BROKER_URL, "front": "__FRONT__",
             "ice": _ICE_VALUES, "utls-imitate": "hellorandomizedalpn"},
@@ -531,19 +550,31 @@ def build_level(level, fronts, pairs=None, profile="safe"):
 
     if profile in ("full", "stealth"):
         template["max"] = "10"
-    if profile == "full":
+    # ampcache applies to every profile that is meant to actually connect, not
+    # just "full".
+    if profile in ("full", "stealth"):
         template["ampcache"] = AMPCACHE.split("=", 1)[1]
     if profile == "stealth":
         template["utls-imitate"] = "hellorandomizedalpn"
         template["utls-nosni"] = "true"
-        template["covertdtls-config"] = "mimic"
+        # randomizemimic is the value in the confirmed working line; plain
+        # mimic keeps the fingerprint constant, which is easier to fingerprint.
+        template["covertdtls-config"] = "randomizemimic"
 
     pairs = IP_FP_PAIRS if pairs is None else pairs
     out = []
     for front in fronts:
         for ip, fp in pairs:
             params = dict(template)
-            params["front"] = front
+            params.pop("front", None)
+            if "ampcache" in params:
+                # The AMP cache can only be used when the front list contains an
+                # ampproject host, so keep the chosen domain as a second choice.
+                chosen = front if front in AMPCACHE_FRONTS else (
+                    AMPCACHE_FRONTS[0] + "," + front)
+                params["fronts"] = chosen
+            else:
+                params["front"] = front
             args = render_params(params)
             out.append(" ".join(["Bridge snowflake", ip, fp] + args))
     return out
@@ -1336,6 +1367,336 @@ def verify_relay_liveness(pairs, broker_url, wait=45, rounds=3, need=2,
         out[key] = (verdict, detail, ms)
     return out
 
+
+# ==============================================================================
+# FULL TUNNEL VERIFICATION
+#
+# Everything above proves the plumbing: the broker answers, the WebRTC answer
+# arrives, the relay claims the fingerprint. None of it proves a single byte of
+# real browsing traffic reaches the internet through the bridge.
+#
+# Only a real Tor process can show that, because it has to agree on a consensus
+# with other relays, download descriptors through the bridge, build a circuit,
+# and then carry an actual request. The proof used here is deliberately the
+# strictest available: Tor must reach 100% and a request must come back from a
+# Tor exit, self reported by check.torproject.org.
+#
+# This stage is slow by nature. It is optional and off by default.
+# ==============================================================================
+
+# Only descriptor caches are copied from an existing Tor installation. The keys
+# directory is deliberately never copied, so guard state stays fresh and the
+# bridge under test is still the one Tor has to use.
+SEED_FILES = ("cached-certs", "cached-descriptors",
+              "cached-microdesc-consensus", "cached-microdescs")
+
+# STUN list confirmed on a working line. Kept identical to STUN so the verified
+# tunnel cannot drift away from the lines the generator hands out.
+TUNNEL_ICE = _ICE_VALUES
+
+
+def find_tor():
+    """Locate tor.exe and lyrebird.exe without touching the user's setup."""
+    candidates = [
+        os.environ.get("TOR_EXE", ""),
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     "Tor Browser", "Browser", "TorBrowser", "Tor", "tor.exe"),
+        r"C:\Net-Tools\tor\tor\tor.exe",
+        "tor.exe",
+    ]
+    tor = next((p for p in candidates if p and os.path.isfile(p)), None)
+    if tor is None:
+        found = shutil.which("tor")
+        tor = found or None
+
+    lyre = None
+    if tor:
+        base = os.path.dirname(tor)
+        for name in (r"pluggable_transports\lyrebird.exe", "lyrebird.exe"):
+            probe = os.path.join(base, name)
+            if os.path.isfile(probe):
+                lyre = probe
+                break
+    if lyre is None:
+        found = shutil.which("lyrebird")
+        lyre = found or None
+    return tor, lyre
+
+
+def _free_port(start):
+    """Return a usable loopback port, walking forward from start."""
+    for port in range(start, start + 400):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        return port
+    return None
+
+
+def _kill_tree(pid):
+    if not pid:
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           capture_output=True)
+        else:
+            subprocess.run(["pkill", "-P", str(pid)], capture_output=True)
+            os.kill(pid, 9)
+    except Exception:
+        pass
+
+
+def tunnel_bridge_line(front, fingerprint, ip, ampcache):
+    """Render the exact bridge line that the tunnel stage will test.
+
+    It has to match what generate_bridges emits, otherwise the stage verifies a
+    line nobody would actually use.
+    """
+    params = {"fingerprint": fingerprint, "url": BROKER_URL,
+              "ice": TUNNEL_ICE,
+              "utls-imitate": "hellorandomizedalpn",
+              "covertdtls-config": "randomizemimic"}
+    if ampcache:
+        params["ampcache"] = AMPCACHE.split("=", 1)[1]
+        params["fronts"] = (front if front in AMPCACHE_FRONTS
+                            else AMPCACHE_FRONTS[0] + "," + front)
+    else:
+        params["front"] = front
+    return " ".join(["Bridge snowflake", ip, fingerprint]
+                    + render_params(params))
+
+
+def _write_tunnel_torrc(path, datadir, socks_port, control_port,
+                        bridge_line, lyrebird):
+    body = "\n".join([
+        "# Scratch instance used only to verify one snowflake bridge.",
+        "DataDirectory %s" % datadir.replace("\\", "/"),
+        "SocksPort %d" % socks_port,
+        "ControlPort %d" % control_port,
+        "",
+        "# Every circuit must use this bridge, so a built circuit cannot be",
+        "# attributed to the public network.",
+        "UseBridges 1",
+        "StrictNodes 1",
+        "",
+        "Log notice stdout",
+        "",
+        "ClientTransportPlugin snowflake exec %s" % lyrebird.replace("\\", "/"),
+        bridge_line,
+        "",
+    ])
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+
+
+def _seed_cache(datadir, seed_dir):
+    """Copy a warm descriptor cache in so Tor need not fetch 9k descriptors."""
+    if not seed_dir or not os.path.isdir(seed_dir):
+        return 0
+    copied = 0
+    for name in SEED_FILES:
+        src = os.path.join(seed_dir, name)
+        if os.path.isfile(src):
+            try:
+                shutil.copy2(src, os.path.join(datadir, name))
+                copied += 1
+            except OSError:
+                pass
+    return copied
+
+
+def _socks5_get_json(host, port, socks_port, timeout=40):
+    """Speak SOCKS5 and TLS by hand, then ask an endpoint who we are."""
+    deadline = time.time() + timeout
+    with socket.create_connection(("127.0.0.1", socks_port),
+                                  timeout=timeout) as raw:
+        raw.settimeout(timeout)
+        raw.sendall(b"\x05\x01\x00")
+        if raw.recv(2) != b"\x05\x00":
+            raise OSError("socks5 negotiation refused")
+
+        name = host.encode("ascii")
+        raw.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name
+                    + port.to_bytes(2, "big"))
+        reply = raw.recv(4)
+        if len(reply) < 2 or reply[1] != 0x00:
+            raise OSError("socks5 connect refused: %r" % (reply,))
+
+        atyp = reply[3] if len(reply) > 3 else 1
+        if atyp == 1:
+            raw.recv(4 + 2)
+        elif atyp == 3:
+            raw.recv(raw.recv(1)[0] + 2)
+        else:
+            raw.recv(16 + 2)
+
+        ctx = ssl.create_default_context()
+        with ctx.wrap_socket(raw, server_hostname=host) as tls:
+            tls.settimeout(max(1, deadline - time.time()))
+            tls.sendall(("GET /api/ip HTTP/1.1\r\nHost: %s\r\n"
+                         "User-Agent: bridge-check\r\n"
+                         "Connection: close\r\n\r\n" % host).encode())
+            buf = b""
+            while len(buf) < 65536:
+                try:
+                    chunk = tls.recv(4096)
+                except (socket.timeout, ssl.SSLError):
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+
+    text = buf.decode("utf-8", "replace")
+    head, _, payload = text.partition("\r\n\r\n")
+    status = head.splitlines()[0] if head else "<no response>"
+    try:
+        data = json.loads(payload.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        data = {}
+    return {"status": status, "is_tor": data.get("IsTor"),
+            "ip": data.get("IP")}
+
+
+def verify_full_tunnel(front, ip, fingerprint, tor, lyrebird,
+                       timeout=300, seed_dir=None, ampcache=False,
+                       workroot=None):
+    """Prove one bridge end to end with a real Tor process.
+
+    Returns (verdict, detail). Verdicts:
+      TUNNEL            bootstrap finished and a request came back via Tor
+      BOOTSTRAP_PARTIAL  the bridge carried Tor but bootstrap never completed
+      BRIDGE_DEAD        the pluggable transport never connected
+      NO_TOR             tor or lyrebird was not found on this machine
+    """
+    work = os.path.join(workroot or tempfile.gettempdir(),
+                        "sf_tunnel_%d_%s" % (os.getpid(),
+                                             abs(hash(front)) % 100000))
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work, exist_ok=True)
+    datadir = os.path.join(work, "data")
+    os.makedirs(datadir, exist_ok=True)
+    socks_port = _free_port(21150)
+    control_port = _free_port(21250) or 0
+    torrc = os.path.join(work, "torrc")
+    logpath = os.path.join(work, "tor.log")
+
+    bridge = tunnel_bridge_line(front, fingerprint, ip, ampcache)
+    _write_tunnel_torrc(torrc, datadir, socks_port, control_port,
+                        bridge, lyrebird)
+    seeded = _seed_cache(datadir, seed_dir)
+
+    proc = None
+    try:
+        with open(logpath, "wb") as log:
+            proc = subprocess.Popen([tor, "-f", torrc],
+                                    stdout=log, stderr=subprocess.STDOUT)
+
+        started = time.time()
+        pct = ""
+        micro = ""
+        while time.time() - started < timeout:
+            if proc.poll() is not None:
+                break
+            try:
+                with open(logpath, "r", encoding="utf-8",
+                          errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                text = ""
+
+            found = re.findall(r"Bootstrapped (\d+%) \(([a-z_]+)\)", text)
+            if found and found[-1][0] != pct:
+                pct = found[-1][0]
+                print("      %s %s" % (front, pct), flush=True)
+            md = re.findall(r"we have (\d+)/(\d+)", text)
+            if md:
+                micro = "%s/%s" % md[-1]
+
+            if "Bootstrapped 100%" in text:
+                break
+            time.sleep(5)
+
+        try:
+            with open(logpath, "r", encoding="utf-8",
+                      errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            text = ""
+
+        pt_ok = "conn_done_pt" in text
+        peer_ok = "rendezvous peer received" in text
+        handshake = "handshake_done" in text
+        guard = "100% of guards bw" in text
+        reached_100 = "Bootstrapped 100%" in text
+        evidence = ("pt=%s peer=%s handshake=%s guard=%s seed=%d"
+                    % (pt_ok, peer_ok, handshake, guard, seeded))
+
+        if not reached_100:
+            if pt_ok or peer_ok or handshake or guard:
+                return ("BOOTSTRAP_PARTIAL",
+                        "%s stopped at %s micro=%s" % (evidence, pct or "?",
+                                                        micro or "?"))
+            return ("BRIDGE_DEAD", "%s no transport progress" % evidence)
+
+        try:
+            probe = _socks5_get_json("check.torproject.org", 443, socks_port)
+        except (OSError, ssl.SSLError) as exc:
+            return ("BOOTSTRAP_PARTIAL", "%s socks failed: %s"
+                    % (evidence, exc))
+        if probe.get("is_tor"):
+            return ("TUNNEL", "%s exit=%s %s" % (evidence,
+                                                 probe.get("ip"),
+                                                 probe.get("status")))
+        return ("BOOTSTRAP_PARTIAL", "%s not a tor exit: %s"
+                % (evidence, probe.get("status")))
+    finally:
+        if proc is not None:
+            _kill_tree(proc.pid)
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def verify_tunnels(candidates, timeout=300, workers=3, seed_dir=None,
+                   workroot=None):
+    """Run the tunnel stage over several fronts, a few at a time.
+
+    Each front gets its own Tor instance, ports and data directory, so the runs
+    cannot interfere. Kept to a handful of workers because every instance is a
+    real Tor client and hammering the broker with many at once makes all of them
+    look broken.
+    """
+    tor, lyre = find_tor()
+    if not tor or not lyre:
+        print("  tor or lyrebird not found, skipping tunnel stage")
+        return {}
+
+    print("  tor      : %s" % tor)
+    print("  lyrebird : %s" % lyre)
+    if seed_dir:
+        print("  seed     : %s" % seed_dir)
+
+    verdicts = {}
+    lock_args = {"tor": tor, "lyrebird": lyre, "timeout": timeout,
+                 "seed_dir": seed_dir, "workroot": workroot}
+
+    def one(item):
+        front, ip, fingerprint, ampcache = item
+        try:
+            return front, verify_full_tunnel(front, ip, fingerprint,
+                                            ampcache=ampcache, **lock_args)
+        except Exception as exc:                     # keep the sweep alive
+            return front, ("UNKNOWN", "harness error: %s" % exc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for front, result in pool.map(one, candidates):
+            verdicts[front] = result
+            print("  %-28s %s" % (front, result[0]), flush=True)
+    return verdicts
+
+
 # ==============================================================================
 # MAIN
 # ==============================================================================
@@ -1472,6 +1833,73 @@ if __name__ == "__main__":
         live_lines = [(t, l, r, m) for t, l, r, m in verified
                       if _verdict(l) == "LIVE"]
 
+        # ---- optional full tunnel verification ----
+        # Opt in because every front here costs a real Tor bootstrap, which
+        # takes minutes. This is the only stage that proves traffic actually
+        # flows, so it is also the only one that can promote a line to TUNNEL.
+        tunnel_verdicts = {}
+        if os.environ.get("SNOWFLAKE_TUNNEL"):
+            limit = int(os.environ.get("SNOWFLAKE_TUNNEL_LIMIT", "12"))
+            workers = int(os.environ.get("SNOWFLAKE_TUNNEL_WORKERS", "3"))
+            secs = int(os.environ.get("SNOWFLAKE_TUNNEL_TIMEOUT", "300"))
+            seed = os.environ.get("SNOWFLAKE_TUNNEL_SEED") or None
+
+            print("")
+            print("=" * 78)
+            print("FULL TUNNEL VERIFICATION (real Tor, real request)")
+            print("=" * 78)
+
+            # One candidate per front, using the strongest line for that front.
+            seen_fronts = set()
+            candidates = []
+            for _, line, _, _ in live_lines:
+                info = parse_bridge_line(line)
+                front = info["front"] or "(direct)"
+                if front in seen_fronts:
+                    continue
+                seen_fronts.add(front)
+                params = dict(info)
+                candidates.append((front, info["ip"],
+                                   info["fingerprint"],
+                                   "ampcache=" in line))
+            candidates = candidates[:limit]
+
+            if candidates:
+                tunnel_verdicts = verify_tunnels(
+                    candidates, timeout=secs, workers=workers, seed_dir=seed)
+                tunnel_lines = [item for item in live_lines
+                                if tunnel_verdicts.get(
+                                    parse_bridge_line(item[1])["front"] or
+                                    "(direct)", ("UNKNOWN",))[0] == "TUNNEL"]
+
+                with open("bridges_TUNNEL.txt", "w", encoding="utf-8") as f:
+                    f.write("# Snowflake Bridges - PROVEN end to end\n")
+                    f.write("# a real Tor client bootstrapped through this front\n")
+                    f.write("# and returned a request from a Tor exit\n")
+                    f.write("# lines: %d\n" % len(tunnel_lines))
+                    f.write("# generated: "
+                            + time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+                    f.write("#" + "=" * 78 + "\n")
+                    for title, line, reason, ms in tunnel_lines:
+                        f.write(line + "\n")
+
+                counts = defaultdict(int)
+                for v in tunnel_verdicts.values():
+                    counts[v[0]] += 1
+                print("")
+                for verdict in ("TUNNEL", "BOOTSTRAP_PARTIAL", "BRIDGE_DEAD"):
+                    if counts.get(verdict):
+                        print("  %-18s : %d" % (verdict, counts[verdict]))
+                print("  -> bridges_TUNNEL.txt (%d lines)"
+                      % len(tunnel_lines))
+            else:
+                print("  no LIVE front to test")
+        else:
+            print("")
+            print("  (full tunnel verification skipped)")
+            print("  set SNOWFLAKE_TUNNEL=1 to prove lines with a real Tor")
+            print("  client, which takes a few minutes per front")
+
         flaky_lines = [(t, l, r, m) for t, l, r, m in verified
                        if _verdict(l) == "FLAKY"]
 
@@ -1517,6 +1945,9 @@ if __name__ == "__main__":
                 "verified_lines": [l for _, l, _, _ in verified],
                 "failed_lines": [{"line": l, "reason": r} for _, l, r, _ in failed],
                 "live_lines": [l for _, l, _, _ in live_lines],
+                "tunnel_verification": {
+                    front: {"verdict": v[0], "detail": v[1]}
+                    for front, v in tunnel_verdicts.items()},
                 "relay_liveness": {"%s | %s" % (k[0], k[1]):
                                    {"verdict": v[0], "detail": v[1], "ms": v[2]}
                                    for k, v in live_fp.items()},
